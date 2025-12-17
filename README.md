@@ -81,7 +81,7 @@ You can configure the recoverer using environment variables.
 
 Storage credentials work similar to collector.
 
-## How It Works
+## How it works
 
 **Collection:**
 1. Identifies healthy cluster nodes and selects the one with oldest binlogs
