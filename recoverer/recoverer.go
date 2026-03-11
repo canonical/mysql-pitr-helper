@@ -15,9 +15,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/percona/percona-xtradb-cluster-operator/cmd/pitr/pxc"
 	"github.com/percona/percona-xtradb-cluster-operator/pkg/naming"
 	"github.com/percona/percona-xtradb-cluster-operator/pkg/pxc/backup/storage"
+	"github.com/percona/percona-xtradb-cluster-operator/pxc"
 
 	"github.com/pkg/errors"
 )
