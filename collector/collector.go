@@ -80,18 +80,18 @@ type Collector struct {
 	db              *pxc.PXC
 	storage         storage.Storage
 	lastUploadedSet pxc.GTIDSet // last uploaded binary logs set
-	pxcServiceName  string      // k8s service name for PXC, its for get correct host for connection
-	pxcUser         string      // user for connection to PXC
-	pxcPass         string      // password for connection to PXC
-	gtidCacheKey    string      // filename of gtid cache json
+	hosts           []string
+	user            string // user for connection to the MySQL
+	pass            string // password for connection to the MySQL
+	gtidCacheKey    string // filename of gtid cache json
 	sourceID        string
 }
 
 type Config struct {
-	PXCServiceName     string `env:"PXC_SERVICE,required"`
-	PXCUser            string `env:"PXC_USER,required"`
-	PXCPass            string `env:"PXC_PASS,required"`
-	StorageType        string `env:"STORAGE_TYPE,required"`
+	Hosts              []string `env:"HOSTS,required"` // Only Primary cluster nodes are expected
+	User               string   `env:"USER,required"`
+	Pass               string   `env:"PASS,required"`
+	StorageType        string   `env:"STORAGE_TYPE,required"`
 	BackupStorageS3    BackupS3
 	BackupStorageAzure BackupAzure
 	BufferSize         int64   `env:"BUFFER_SIZE"`
@@ -162,21 +162,12 @@ func New(ctx context.Context, c Config) (*Collector, error) {
 		return nil, errors.New("unknown STORAGE_TYPE")
 	}
 
-	file, err := os.Open(collectorPasswordPath)
-	if err != nil {
-		return nil, errors.Wrap(err, "open file")
-	}
-	pxcPass, err := io.ReadAll(file)
-	if err != nil {
-		return nil, errors.Wrap(err, "read password")
-	}
-
 	return &Collector{
-		storage:        s,
-		pxcUser:        c.PXCUser,
-		pxcPass:        string(pxcPass),
-		pxcServiceName: c.PXCServiceName,
-		gtidCacheKey:   c.GTIDCacheKey,
+		storage:      s,
+		hosts:        c.Hosts,
+		user:         c.User,
+		pass:         c.Pass,
+		gtidCacheKey: c.GTIDCacheKey,
 	}, nil
 }
 
@@ -189,12 +180,12 @@ func (c *Collector) GetGTIDCacheKey() string {
 }
 
 func (c *Collector) Init(ctx context.Context) error {
-	host, err := pxc.GetPXCFirstHost(ctx, c.pxcServiceName)
+	host, err := pxc.GetPXCOldestBinlogHost(ctx, c.hosts, c.user, c.pass)
 	if err != nil {
-		return errors.Wrap(err, "get first PXC host")
+		return errors.Wrap(err, "get host")
 	}
 
-	db, err := pxc.NewPXC(host, c.pxcUser, c.pxcPass)
+	db, err := pxc.NewPXC(host, c.user, c.pass)
 	if err != nil {
 		return errors.Wrapf(err, "new manager with host %s", host)
 	}
@@ -208,7 +199,7 @@ func (c *Collector) Init(ctx context.Context) error {
 	switch {
 	case strings.HasPrefix(version, "8.0"):
 		log.Println("creating collector functions")
-		if err := c.CreateCollectorFunctions(ctx); err != nil {
+		if err := c.CreateCollectorFunctions(ctx, c.hosts); err != nil {
 			return errors.Wrap(err, "init 8.0: create collector functions")
 		}
 	case strings.HasPrefix(version, "8.4"):
@@ -221,16 +212,9 @@ func (c *Collector) Init(ctx context.Context) error {
 	return nil
 }
 
-func (c *Collector) CreateCollectorFunctions(ctx context.Context) error {
-	nodes, err := pxc.GetNodesByServiceName(ctx, c.pxcServiceName)
-	if err != nil {
-		return errors.Wrap(err, "get nodes by service name")
-	}
-
-	create := func(node string) error {
-		nodeArr := strings.Split(node, ":")
-		host := nodeArr[0]
-		db, err := pxc.NewPXC(host, c.pxcUser, c.pxcPass)
+func (c *Collector) CreateCollectorFunctions(ctx context.Context, hosts []string) error {
+	for _, host := range hosts {
+		db, err := pxc.NewPXC(host, c.user, c.pass)
 		if err != nil {
 			return errors.Errorf("creating connection for host %s: %v", host, err)
 		}
@@ -241,15 +225,14 @@ func (c *Collector) CreateCollectorFunctions(ctx context.Context) error {
 		return nil
 	}
 
-	for _, node := range nodes {
-		if strings.Contains(node, "wsrep_ready:ON:wsrep_connected:ON:wsrep_local_state_comment:Synced:wsrep_cluster_status:Primary") {
-			if err := create(node); err != nil {
-				return err
-			}
-		}
-	}
-
 	return nil
+}
+
+func (c *Config) SetDefaults() {
+	c.BackupStorageS3.Endpoint = "s3.amazonaws.com"
+	c.CollectSpanSec = 60
+	c.VerifyTLS = true
+	c.TimeoutSeconds = 60
 }
 
 func (c *Collector) Run(ctx context.Context) error {
@@ -295,14 +278,19 @@ func (c *Collector) lastGTIDSet(ctx context.Context, suffix string) (pxc.GTIDSet
 }
 
 func (c *Collector) newDB(ctx context.Context) error {
-	host, err := pxc.GetPXCOldestBinlogHost(ctx, c.pxcServiceName, c.pxcUser, c.pxcPass)
+	healthyHosts, err := pxc.FilterHealthyClusterMembers(ctx, c.hosts, c.user, c.pass)
+	if err != nil {
+		return errors.Wrap(err, "filter healthy cluster members")
+	}
+
+	host, err := pxc.GetPXCOldestBinlogHost(ctx, healthyHosts, c.user, c.pass)
 	if err != nil {
 		return errors.Wrap(err, "get host")
 	}
 
 	log.Println("reading binlogs from pxc with hostname=", host)
 
-	c.db, err = pxc.NewPXC(host, c.pxcUser, c.pxcPass)
+	c.db, err = pxc.NewPXC(host, c.user, c.pass)
 	if err != nil {
 		return errors.Wrapf(err, "new manager with host %s", host)
 	}
@@ -707,8 +695,8 @@ func (c *Collector) manageBinlog(ctx context.Context, binlog pxc.Binlog) (err er
 	}
 
 	errBuf := &bytes.Buffer{}
-	cmd := exec.CommandContext(ctx, "mysqlbinlog", "-R", "-P", "33062", "--raw", "-h"+c.db.GetHost(), "-u"+c.pxcUser, binlog.Name)
-	cmd.Env = append(cmd.Env, "MYSQL_PWD="+c.pxcPass)
+	cmd := exec.CommandContext(ctx, "mysqlbinlog", "-R", "-P", "33062", "--raw", "-h"+c.db.GetHost(), "-u"+c.user, binlog.Name)
+	cmd.Env = append(cmd.Env, "MYSQL_PWD="+c.pass)
 	cmd.Dir = os.TempDir()
 	cmd.Stderr = errBuf
 
