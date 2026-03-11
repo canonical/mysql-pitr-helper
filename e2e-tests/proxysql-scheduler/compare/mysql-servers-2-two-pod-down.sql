@@ -1,4 +1,0 @@
-10	some-name-pxc-0	600	ONLINE
-11	some-name-pxc-0	1000000	ONLINE
-8010	some-name-pxc-0	600	ONLINE
-8011	some-name-pxc-0	1000000	ONLINE
