@@ -1,0 +1,20 @@
+#!/usr/bin/make -f
+
+# export DH_VERBOSE := 1
+
+# Required for dh_golang to copy all the vendor content
+export DH_GOLANG_INSTALL_ALL := 1
+export PATH := $(PATH):/usr/lib/go-1.23/bin
+export GOTOOLCHAIN := local
+
+%:
+	dh $@ --builddirectory=_build --buildsystem=golang
+
+override_dh_auto_install:
+	dh_auto_install -- --no-source
+
+override_dh_dwz:
+	# Fails on dwz: debian/mysql-pitr-helper/usr/bin/mysql-pitr-helper: Found compressed .debug_aranges section, not attempting dwz compression
+	# Should be fixed already, but somehow still occurs
+	# See https://lists.debian.org/debian-devel/2019/07/msg00162.html
+	:
