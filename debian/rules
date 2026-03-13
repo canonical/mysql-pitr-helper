@@ -4,7 +4,7 @@
 
 # Required for dh_golang to copy all the vendor content
 export DH_GOLANG_INSTALL_ALL := 1
-export PATH := $(PATH):/usr/lib/go-1.23/bin
+export PATH := $(PATH):/usr/lib/go-1.25/bin
 export GOTOOLCHAIN := local
 
 %:
