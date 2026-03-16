@@ -72,7 +72,6 @@ Session.vim
 .netrwhist
 # auto-generated tag files
 tags
-vendor/
 ### VisualStudioCode ###
 .vscode/*
 .history
