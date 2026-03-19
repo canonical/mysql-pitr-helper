@@ -6,7 +6,7 @@ import (
 	stderrors "errors"
 	"fmt"
 	"log"
-	"os/exec"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -273,6 +273,17 @@ func (p *PXC) GetBinLogLastTimestamp(ctx context.Context, binlog string) (string
 	return timestamp, nil
 }
 
+func (p *PXC) GetCurrentGTIDSet(ctx context.Context) (string, error) {
+	var result string
+	row := p.db.QueryRowContext(ctx, "SELECT @@GLOBAL.gtid_executed;")
+	err := row.Scan(&result)
+	if err != nil {
+		return "", errors.Wrap(err, "scan current gtid_executed result")
+	}
+
+	return result, nil
+}
+
 func (p *PXC) SubtractGTIDSet(ctx context.Context, set, subSet string) (string, error) {
 	var result string
 	row := p.db.QueryRowContext(ctx, "SELECT GTID_SUBTRACT(?,?)", set, subSet)
@@ -284,60 +295,70 @@ func (p *PXC) SubtractGTIDSet(ctx context.Context, set, subSet string) (string, 
 	return result, nil
 }
 
-func GetNodesByServiceName(ctx context.Context, pxcServiceName string) ([]string, error) {
-	cmd := exec.CommandContext(ctx, "/opt/percona/peer-list", "-on-start=/opt/percona/get-pxc-state.sh", "-service="+pxcServiceName)
-	out, err := cmd.CombinedOutput()
+func (p *PXC) GetHealthyClusterMembers(ctx context.Context) ([]string, error) {
+	rows, err := p.db.QueryContext(ctx, "SELECT MEMBER_HOST FROM performance_schema.replication_group_members WHERE MEMBER_STATE = 'ONLINE'")
 	if err != nil {
-		return nil, errors.Wrapf(err, "run peer-list output: %s", out)
+		return nil, errors.Wrap(err, "select replication_group_members")
 	}
-	return strings.Split(string(out), "node:"), nil
+	defer rows.Close()
+
+	var hosts []string
+	for rows.Next() {
+		var host string
+		if err = rows.Scan(&host); err != nil {
+			return nil, errors.Wrap(err, "scan host")
+		}
+		hosts = append(hosts, host)
+	}
+
+	return hosts, nil
 }
 
-func GetPXCFirstHost(ctx context.Context, pxcServiceName string) (string, error) {
-	nodes, err := GetNodesByServiceName(ctx, pxcServiceName)
-	if err != nil {
-		return "", errors.Wrap(err, "get nodes by service name")
-	}
-	sort.Strings(nodes)
-	lastHost := ""
-	for _, node := range nodes {
-		log.Printf("PXC Node: %s", node)
-		if strings.Contains(node, "wsrep_ready:ON:wsrep_connected:ON:wsrep_local_state_comment:Synced:wsrep_cluster_status:Primary") {
-			nodeArr := strings.Split(node, ":")
-			lastHost = nodeArr[0]
+func FilterHealthyClusterMembers(ctx context.Context, hosts []string, user, pass string) ([]string, error) {
+	var healthyMembers []string
+	for _, host := range hosts {
+		db, err := NewPXC(host, user, pass)
+		if err != nil {
+			log.Printf("ERROR: creating connection for host %s: %v", host, err)
+			continue
+		}
+		healthyMembers, err = db.GetHealthyClusterMembers(ctx)
+		db.Close()
+		if err != nil {
+			log.Printf("ERROR: get healthy cluster members for host %s: %v", host, err)
+			continue
+		}
+		if len(healthyMembers) != 0 {
 			break
 		}
 	}
-	if len(lastHost) == 0 {
-		return "", errors.New("can't find host")
+	if len(healthyMembers) == 0 {
+		return nil, errors.New("no healthy cluster members detected")
 	}
-
-	log.Printf("connecting to %s", lastHost)
-
-	return lastHost, nil
+	var healthyHosts []string
+	for _, host := range hosts {
+		if slices.Contains(healthyMembers, host) {
+			healthyHosts = append(healthyHosts, host)
+		}
+	}
+	if len(healthyHosts) == 0 {
+		return nil, errors.New("no healthy cluster members found in provided hosts")
+	}
+	return healthyHosts, nil
 }
 
-func GetPXCOldestBinlogHost(ctx context.Context, pxcServiceName, user, pass string) (string, error) {
-	nodes, err := GetNodesByServiceName(ctx, pxcServiceName)
-	if err != nil {
-		return "", errors.Wrap(err, "get nodes by service name")
-	}
-
+func GetPXCOldestBinlogHost(ctx context.Context, hosts []string, user, pass string) (string, error) {
 	var oldestHost string
 	var oldestTS int64
-	for _, node := range nodes {
-		if strings.Contains(node, "wsrep_ready:ON:wsrep_connected:ON:wsrep_local_state_comment:Synced:wsrep_cluster_status:Primary") {
-			nodeArr := strings.Split(node, ":")
-			binlogTime, err := getBinlogTime(ctx, nodeArr[0], user, pass)
-			if err != nil {
-				log.Printf("ERROR: get binlog time: %v", err)
-				continue
-			}
-			if len(oldestHost) == 0 || oldestTS > 0 && binlogTime < oldestTS {
-				oldestHost = nodeArr[0]
-				oldestTS = binlogTime
-			}
-
+	for _, host := range hosts {
+		binlogTime, err := getBinlogTime(ctx, host, user, pass)
+		if err != nil {
+			log.Printf("ERROR: get binlog time %v", err)
+			continue
+		}
+		if len(oldestHost) == 0 || oldestTS > 0 && binlogTime < oldestTS {
+			oldestHost = host
+			oldestTS = binlogTime
 		}
 	}
 

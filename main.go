@@ -168,6 +168,8 @@ func runRecoverer(ctx context.Context) {
 
 func getCollectorConfig() (collector.Config, error) {
 	cfg := collector.Config{}
+	cfg.SetDefaults()
+
 	err := env.Parse(&cfg)
 	switch cfg.StorageType {
 	case "s3":
@@ -192,16 +194,10 @@ func getRecovererConfig() (recoverer.Config, error) {
 	}
 	switch cfg.StorageType {
 	case "s3":
-		if err := env.Parse(&cfg.BackupStorageS3); err != nil {
-			return cfg, err
-		}
 		if err := env.Parse(&cfg.BinlogStorageS3); err != nil {
 			return cfg, err
 		}
 	case "azure":
-		if err := env.Parse(&cfg.BackupStorageAzure); err != nil {
-			return cfg, err
-		}
 		if err := env.Parse(&cfg.BinlogStorageAzure); err != nil {
 			return cfg, err
 		}
