@@ -1,0 +1,29 @@
+mysql-pitr-helper (2-0ubuntu0.22.04.1) jammy; urgency=medium
+
+  * Initial release
+
+ -- Lena Voytek <lena.voytek@canonical.com>  Wed, 18 Dec 2024 08:52:20 -0500
+
+mysql-pitr-helper (1-3ubuntu0.22.04.1) jammy; urgency=medium
+
+  * Fix build.
+
+ -- Vladyslav Tarasenko <v.tarasenko@jazzserve.com>  Mon, 02 Dec 2024 12:20:00 +0200
+
+mysql-pitr-helper (1-2ubuntu0.22.04.1) jammy; urgency=medium
+
+  * Fix build.
+
+ -- Vladyslav Tarasenko <v.tarasenko@jazzserve.com>  Mon, 02 Dec 2024 11:59:31 +0200
+
+mysql-pitr-helper (1-1ubuntu0.22.04.1) jammy; urgency=medium
+
+  * Fixed GOCACHE.
+
+ -- Vladyslav Tarasenko <v.tarasenko@jazzserve.com>  Mon, 02 Dec 2024 09:41:31 +0000
+
+mysql-pitr-helper (1-0ubuntu0.22.04.1) jammy; urgency=medium
+
+  * Initial release.
+
+ -- Vladyslav Tarasenko <v.tarasenko@jazzserve.com>  Wed, 27 Nov 2024 01:14:13 +0200
