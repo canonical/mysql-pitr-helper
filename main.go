@@ -11,8 +11,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/percona/percona-xtradb-cluster-operator/collector"
-	"github.com/percona/percona-xtradb-cluster-operator/recoverer"
+	"mysql-pitr-helper/collector"
+	"mysql-pitr-helper/recoverer"
 
 	"github.com/caarlos0/env"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
