@@ -13,11 +13,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/percona/percona-xtradb-cluster-operator/pkg/naming"
-	"github.com/percona/percona-xtradb-cluster-operator/pkg/pxc/backup/storage"
-	"github.com/percona/percona-xtradb-cluster-operator/pxc"
-
 	"github.com/pkg/errors"
+
+	"mysql-pitr-helper/pkg/naming"
+	"mysql-pitr-helper/pkg/pxc/backup/storage"
+	"mysql-pitr-helper/pxc"
 )
 
 type Recoverer struct {

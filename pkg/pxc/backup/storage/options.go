@@ -1,6 +1,6 @@
 package storage
 
-import api "github.com/percona/percona-xtradb-cluster-operator/pkg/apis/pxc/v1"
+import api "mysql-pitr-helper/pkg/apis/pxc/v1"
 
 type Options interface {
 	Type() api.BackupStorageType

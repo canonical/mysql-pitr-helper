@@ -1,4 +1,4 @@
-module github.com/percona/percona-xtradb-cluster-operator
+module mysql-pitr-helper
 
 go 1.25.3
 

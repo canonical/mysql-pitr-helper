@@ -19,7 +19,7 @@ import (
 	"github.com/pkg/errors"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
-	api "github.com/percona/percona-xtradb-cluster-operator/pkg/apis/pxc/v1"
+	api "mysql-pitr-helper/pkg/apis/pxc/v1"
 )
 
 var ErrObjectNotFound = errors.New("object not found")
