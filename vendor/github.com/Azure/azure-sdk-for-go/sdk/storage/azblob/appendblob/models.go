@@ -112,8 +112,6 @@ type AppendBlockFromURLOptions struct {
 
 	CPKScopeInfo *blob.CPKScopeInfo
 
-	FileRequestIntent *blob.FileRequestIntentType
-
 	SourceModifiedAccessConditions *blob.SourceModifiedAccessConditions
 
 	AccessConditions *blob.AccessConditions
@@ -132,7 +130,6 @@ func (o *AppendBlockFromURLOptions) format() (*generated.AppendBlobClientAppendB
 	options := &generated.AppendBlobClientAppendBlockFromURLOptions{
 		SourceRange:             exported.FormatHTTPRange(o.Range),
 		CopySourceAuthorization: o.CopySourceAuthorization,
-		FileRequestIntent:       o.FileRequestIntent,
 	}
 
 	if o.SourceContentValidation != nil {

@@ -83,14 +83,11 @@ type Writer struct {
 	snappy            bool
 	flushOnWrite      bool
 	appendIndex       bool
-	bufferCB          func([]byte)
 	level             uint8
 }
 
 type result struct {
 	b []byte
-	// return when writing
-	ret []byte
 	// Uncompressed start offset
 	startOffset int64
 }
@@ -149,10 +146,6 @@ func (w *Writer) Reset(writer io.Writer) {
 		for write := range toWrite {
 			// Wait for the data to be available.
 			input := <-write
-			if input.ret != nil && w.bufferCB != nil {
-				w.bufferCB(input.ret)
-				input.ret = nil
-			}
 			in := input.b
 			if len(in) > 0 {
 				if w.err(nil) == nil {
@@ -348,8 +341,7 @@ func (w *Writer) AddSkippableBlock(id uint8, data []byte) (err error) {
 // but the input buffer cannot be written to by the caller
 // until Flush or Close has been called when concurrency != 1.
 //
-// Use the WriterBufferDone to receive a callback when the buffer is done
-// Processing.
+// If you cannot control that, use the regular Write function.
 //
 // Note that input is not buffered.
 // This means that each write will result in discrete blocks being created.
@@ -372,9 +364,6 @@ func (w *Writer) EncodeBuffer(buf []byte) (err error) {
 	}
 	if w.concurrency == 1 {
 		_, err := w.writeSync(buf)
-		if w.bufferCB != nil {
-			w.bufferCB(buf)
-		}
 		return err
 	}
 
@@ -389,7 +378,7 @@ func (w *Writer) EncodeBuffer(buf []byte) (err error) {
 			hWriter <- result{startOffset: w.uncompWritten, b: magicChunkBytes}
 		}
 	}
-	orgBuf := buf
+
 	for len(buf) > 0 {
 		// Cut input.
 		uncompressed := buf
@@ -408,9 +397,6 @@ func (w *Writer) EncodeBuffer(buf []byte) (err error) {
 			startOffset: w.uncompWritten,
 		}
 		w.uncompWritten += int64(len(uncompressed))
-		if len(buf) == 0 && w.bufferCB != nil {
-			res.ret = orgBuf
-		}
 		go func() {
 			race.ReadSlice(uncompressed)
 
@@ -936,7 +922,7 @@ func WriterBetterCompression() WriterOption {
 }
 
 // WriterBestCompression will enable better compression.
-// EncodeBest compresses better than Encode but typically with a
+// EncodeBetter compresses better than Encode but typically with a
 // big speed decrease on compression.
 func WriterBestCompression() WriterOption {
 	return func(w *Writer) error {
@@ -951,17 +937,6 @@ func WriterBestCompression() WriterOption {
 func WriterUncompressed() WriterOption {
 	return func(w *Writer) error {
 		w.level = levelUncompressed
-		return nil
-	}
-}
-
-// WriterBufferDone will perform a callback when EncodeBuffer has finished
-// writing a buffer to the output and the buffer can safely be reused.
-// If the buffer was split into several blocks, it will be sent after the last block.
-// Callbacks will not be done concurrently.
-func WriterBufferDone(fn func(b []byte)) WriterOption {
-	return func(w *Writer) error {
-		w.bufferCB = fn
 		return nil
 	}
 }

@@ -23,6 +23,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"math/rand"
 	"net"
@@ -38,13 +39,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/dustin/go-humanize"
 	md5simd "github.com/minio/md5-simd"
 	"github.com/minio/minio-go/v7/pkg/credentials"
-	"github.com/minio/minio-go/v7/pkg/kvcache"
 	"github.com/minio/minio-go/v7/pkg/s3utils"
 	"github.com/minio/minio-go/v7/pkg/signer"
-	"github.com/minio/minio-go/v7/pkg/singleflight"
 	"golang.org/x/net/publicsuffix"
 )
 
@@ -71,11 +69,9 @@ type Client struct {
 	secure bool
 
 	// Needs allocation.
-	httpClient         *http.Client
-	httpTrace          *httptrace.ClientTrace
-	bucketLocCache     *kvcache.Cache[string, string]
-	bucketSessionCache *kvcache.Cache[string, credentials.Value]
-	credsGroup         singleflight.Group[string, credentials.Value]
+	httpClient     *http.Client
+	httpTrace      *httptrace.ClientTrace
+	bucketLocCache *bucketLocationCache
 
 	// Advanced functionality.
 	isTraceEnabled  bool
@@ -97,9 +93,6 @@ type Client struct {
 	// default to Auto.
 	lookup BucketLookupType
 
-	// lookupFn is a custom function to return URL lookup type supported by the server.
-	lookupFn func(u url.URL, bucketName string) BucketLookupType
-
 	// Factory for MD5 hash functions.
 	md5Hasher    func() md5simd.Hasher
 	sha256Hasher func() md5simd.Hasher
@@ -107,7 +100,6 @@ type Client struct {
 	healthStatus int32
 
 	trailingHeaderSupport bool
-	maxRetries            int
 }
 
 // Options for New method
@@ -125,25 +117,6 @@ type Options struct {
 	// function to perform region lookups appropriately.
 	CustomRegionViaURL func(u url.URL) string
 
-	// Provide a custom function that returns BucketLookupType based
-	// on the input URL, this is just like s3utils.IsVirtualHostSupported()
-	// function but allows users to provide their own implementation.
-	// Once this is set it overrides all settings for opts.BucketLookup
-	// if this function returns BucketLookupAuto then default detection
-	// via s3utils.IsVirtualHostSupported() is used, otherwise the
-	// function is expected to return appropriate value as expected for
-	// the URL the user wishes to honor.
-	//
-	// BucketName is passed additionally for the caller to ensure
-	// handle situations where `bucketNames` have multiple `.` separators
-	// in such case HTTPs certs will not work properly for *.<domain>
-	// wildcards, so you need to specifically handle these situations
-	// and not return bucket as part of DNS since those requests may fail.
-	//
-	// For better understanding look at s3utils.IsVirtualHostSupported()
-	// implementation.
-	BucketLookupViaURL func(u url.URL, bucketName string) BucketLookupType
-
 	// TrailingHeaders indicates server support of trailing headers.
 	// Only supported for v4 signatures.
 	TrailingHeaders bool
@@ -151,16 +124,12 @@ type Options struct {
 	// Custom hash routines. Leave nil to use standard.
 	CustomMD5    func() md5simd.Hasher
 	CustomSHA256 func() md5simd.Hasher
-
-	// Number of times a request is retried. Defaults to 10 retries if this option is not configured.
-	// Set to 1 to disable retries.
-	MaxRetries int
 }
 
 // Global constants.
 const (
 	libraryName    = "minio-go"
-	libraryVersion = "v7.0.96"
+	libraryVersion = "v7.0.74"
 )
 
 // User Agent should always following the below style.
@@ -202,9 +171,7 @@ func New(endpoint string, opts *Options) (*Client, error) {
 	return clnt, nil
 }
 
-// EndpointURL returns the URL of the S3-compatible endpoint that this client connects to.
-//
-// Returns a copy of the endpoint URL to prevent modification of internal state.
+// EndpointURL returns the URL of the S3 endpoint.
 func (c *Client) EndpointURL() *url.URL {
 	endpoint := *c.endpointURL // copy to prevent callers from modifying internal state
 	return &endpoint
@@ -221,7 +188,7 @@ func (r *lockedRandSource) Int63() (n int64) {
 	r.lk.Lock()
 	n = r.src.Int63()
 	r.lk.Unlock()
-	return n
+	return
 }
 
 // Seed uses the provided seed value to initialize the generator to a
@@ -287,11 +254,8 @@ func privateNew(endpoint string, opts *Options) (*Client, error) {
 	}
 	clnt.region = opts.Region
 
-	// Initialize bucket region cache.
-	clnt.bucketLocCache = &kvcache.Cache[string, string]{}
-
-	// Initialize bucket session cache (s3 express).
-	clnt.bucketSessionCache = &kvcache.Cache[string, credentials.Value]{}
+	// Instantiate bucket location cache.
+	clnt.bucketLocCache = newBucketLocationCache()
 
 	// Introduce a new locked random seed.
 	clnt.random = rand.New(&lockedRandSource{src: rand.NewSource(time.Now().UTC().UnixNano())})
@@ -311,28 +275,15 @@ func privateNew(endpoint string, opts *Options) (*Client, error) {
 	// Sets bucket lookup style, whether server accepts DNS or Path lookup. Default is Auto - determined
 	// by the SDK. When Auto is specified, DNS lookup is used for Amazon/Google cloud endpoints and Path for all other endpoints.
 	clnt.lookup = opts.BucketLookup
-	clnt.lookupFn = opts.BucketLookupViaURL
 
 	// healthcheck is not initialized
 	clnt.healthStatus = unknown
-
-	clnt.maxRetries = MaxRetry
-	if opts.MaxRetries > 0 {
-		clnt.maxRetries = opts.MaxRetries
-	}
 
 	// Return.
 	return clnt, nil
 }
 
-// SetAppInfo adds custom application name and version to the User-Agent header for all requests.
-// This helps identify your application in server logs and metrics.
-//
-// Parameters:
-//   - appName: Name of the application
-//   - appVersion: Version of the application
-//
-// Both parameters must be non-empty for the custom User-Agent to be set.
+// SetAppInfo - add application details to user agent.
 func (c *Client) SetAppInfo(appName, appVersion string) {
 	// if app name and version not set, we do not set a new user agent.
 	if appName != "" && appVersion != "" {
@@ -341,11 +292,7 @@ func (c *Client) SetAppInfo(appName, appVersion string) {
 	}
 }
 
-// TraceOn enables HTTP request and response tracing for debugging purposes.
-// All HTTP traffic will be written to the provided output stream.
-//
-// Parameters:
-//   - outputStream: Writer where trace output will be written (defaults to os.Stdout if nil)
+// TraceOn - enable HTTP tracing.
 func (c *Client) TraceOn(outputStream io.Writer) {
 	// if outputStream is nil then default to os.Stdout.
 	if outputStream == nil {
@@ -358,23 +305,19 @@ func (c *Client) TraceOn(outputStream io.Writer) {
 	c.isTraceEnabled = true
 }
 
-// TraceErrorsOnlyOn enables HTTP tracing but only for requests that result in errors.
-// This is useful for debugging without the overhead of tracing all requests.
-//
-// Parameters:
-//   - outputStream: Writer where trace output will be written (defaults to os.Stdout if nil)
+// TraceErrorsOnlyOn - same as TraceOn, but only errors will be traced.
 func (c *Client) TraceErrorsOnlyOn(outputStream io.Writer) {
 	c.TraceOn(outputStream)
 	c.traceErrorsOnly = true
 }
 
-// TraceErrorsOnlyOff disables errors-only mode and traces all requests.
-// To disable all tracing, call TraceOff() instead.
+// TraceErrorsOnlyOff - Turns off the errors only tracing and everything will be traced after this call.
+// If all tracing needs to be turned off, call TraceOff().
 func (c *Client) TraceErrorsOnlyOff() {
 	c.traceErrorsOnly = false
 }
 
-// TraceOff disables all HTTP tracing (both normal and errors-only modes).
+// TraceOff - disable HTTP tracing.
 func (c *Client) TraceOff() {
 	// Disable tracing.
 	c.isTraceEnabled = false
@@ -473,7 +416,7 @@ func (c *Client) HealthCheck(hcDuration time.Duration) (context.CancelFunc, erro
 		gcancel()
 		if !IsNetworkOrHostDown(err, false) {
 			switch ToErrorResponse(err).Code {
-			case NoSuchBucket, AccessDenied, "":
+			case "NoSuchBucket", "AccessDenied", "":
 				atomic.CompareAndSwapInt32(&c.healthStatus, offline, online)
 			}
 		}
@@ -495,7 +438,7 @@ func (c *Client) HealthCheck(hcDuration time.Duration) (context.CancelFunc, erro
 					gcancel()
 					if !IsNetworkOrHostDown(err, false) {
 						switch ToErrorResponse(err).Code {
-						case NoSuchBucket, AccessDenied, "":
+						case "NoSuchBucket", "AccessDenied", "":
 							atomic.CompareAndSwapInt32(&c.healthStatus, offline, online)
 						}
 					}
@@ -528,10 +471,8 @@ type requestMetadata struct {
 	contentMD5Base64 string // carries base64 encoded md5sum
 	contentSHA256Hex string // carries hex encoded sha256sum
 	streamSha256     bool
-	addCrc           *ChecksumType
+	addCrc           bool
 	trailer          http.Header // (http.Request).Trailer. Requires v4 signature.
-
-	expect200OKWithError bool
 }
 
 // dumpHTTP - dump HTTP request and response.
@@ -625,7 +566,7 @@ func (c *Client) do(req *http.Request) (resp *http.Response, err error) {
 
 	// If trace is enabled, dump http request and response,
 	// except when the traceErrorsOnly enabled and the response's status code is ok
-	if c.isTraceEnabled && (!c.traceErrorsOnly || resp.StatusCode != http.StatusOK) {
+	if c.isTraceEnabled && !(c.traceErrorsOnly && resp.StatusCode == http.StatusOK) {
 		err = c.dumpHTTP(req, resp)
 		if err != nil {
 			return nil, err
@@ -636,10 +577,10 @@ func (c *Client) do(req *http.Request) (resp *http.Response, err error) {
 }
 
 // List of success status.
-var successStatus = map[int]struct{}{
-	http.StatusOK:             {},
-	http.StatusNoContent:      {},
-	http.StatusPartialContent: {},
+var successStatus = []int{
+	http.StatusOK,
+	http.StatusNoContent,
+	http.StatusPartialContent,
 }
 
 // executeMethod - instantiates a given method, and retries the
@@ -652,7 +593,7 @@ func (c *Client) executeMethod(ctx context.Context, method string, metadata requ
 
 	var retryable bool       // Indicates if request can be retried.
 	var bodySeeker io.Seeker // Extracted seeker from io.Reader.
-	reqRetry := c.maxRetries // Indicates how many times we can retry the request
+	reqRetry := MaxRetry     // Indicates how many times we can retry the request
 
 	if metadata.contentBody != nil {
 		// Check if body is seekable then it is retryable.
@@ -675,19 +616,25 @@ func (c *Client) executeMethod(ctx context.Context, method string, metadata requ
 		}
 	}
 
-	if metadata.addCrc != nil && metadata.contentLength > 0 {
+	if metadata.addCrc && metadata.contentLength > 0 {
 		if metadata.trailer == nil {
 			metadata.trailer = make(http.Header, 1)
 		}
-		crc := metadata.addCrc.Hasher()
+		crc := crc32.New(crc32.MakeTable(crc32.Castagnoli))
 		metadata.contentBody = newHashReaderWrapper(metadata.contentBody, crc, func(hash []byte) {
 			// Update trailer when done.
-			metadata.trailer.Set(metadata.addCrc.Key(), base64.StdEncoding.EncodeToString(hash))
+			metadata.trailer.Set("x-amz-checksum-crc32c", base64.StdEncoding.EncodeToString(hash))
 		})
-		metadata.trailer.Set(metadata.addCrc.Key(), base64.StdEncoding.EncodeToString(crc.Sum(nil)))
+		metadata.trailer.Set("x-amz-checksum-crc32c", base64.StdEncoding.EncodeToString(crc.Sum(nil)))
 	}
 
-	for range c.newRetryTimer(ctx, reqRetry, DefaultRetryUnit, DefaultRetryCap, MaxJitter) {
+	// Create cancel context to control 'newRetryTimer' go routine.
+	retryCtx, cancel := context.WithCancel(ctx)
+
+	// Indicate to our routine to exit cleanly upon return.
+	defer cancel()
+
+	for range c.newRetryTimer(retryCtx, reqRetry, DefaultRetryUnit, DefaultRetryCap, MaxJitter) {
 		// Retry executes the following function body if request has an
 		// error until maxRetries have been exhausted, retry attempts are
 		// performed after waiting for a given period of time in a
@@ -715,45 +662,38 @@ func (c *Client) executeMethod(ctx context.Context, method string, metadata requ
 		// Initiate the request.
 		res, err = c.do(req)
 		if err != nil {
-			if isRequestErrorRetryable(ctx, err) {
+			if isRequestErrorRetryable(err) {
 				// Retry the request
 				continue
 			}
 			return nil, err
 		}
 
-		_, success := successStatus[res.StatusCode]
-		if success && !metadata.expect200OKWithError {
-			// We do not expect 2xx to return an error return.
-			return res, nil
-		} // in all other situations we must first parse the body as ErrorResponse
+		// For any known successful http status, return quickly.
+		for _, httpStatus := range successStatus {
+			if httpStatus == res.StatusCode {
+				return res, nil
+			}
+		}
 
-		// 5MiB is sufficiently large enough to hold any error or regular XML response.
-		var bodyBytes []byte
-		bodyBytes, err = io.ReadAll(io.LimitReader(res.Body, 5*humanize.MiByte))
-		// By now, res.Body should be closed
+		// Read the body to be saved later.
+		errBodyBytes, err := io.ReadAll(res.Body)
+		// res.Body should be closed
 		closeResponse(res)
 		if err != nil {
 			return nil, err
 		}
 
 		// Save the body.
-		bodySeeker := bytes.NewReader(bodyBytes)
-		res.Body = io.NopCloser(bodySeeker)
-
-		apiErr := httpRespToErrorResponse(res, metadata.bucketName, metadata.objectName)
-
-		// Save the body back again.
-		bodySeeker.Seek(0, 0) // Seek back to starting point.
-		res.Body = io.NopCloser(bodySeeker)
-
-		if apiErr == nil {
-			return res, nil
-		}
+		errBodySeeker := bytes.NewReader(errBodyBytes)
+		res.Body = io.NopCloser(errBodySeeker)
 
 		// For errors verify if its retryable otherwise fail quickly.
-		errResponse := ToErrorResponse(apiErr)
-		err = errResponse
+		errResponse := ToErrorResponse(httpRespToErrorResponse(res, metadata.bucketName, metadata.objectName))
+
+		// Save the body back again.
+		errBodySeeker.Seek(0, 0) // Seek back to starting point.
+		res.Body = io.NopCloser(errBodySeeker)
 
 		// Bucket region if set in error response and the error
 		// code dictates invalid region, we can retry the request
@@ -763,11 +703,11 @@ func (c *Client) executeMethod(ctx context.Context, method string, metadata requ
 		// region is empty.
 		if c.region == "" {
 			switch errResponse.Code {
-			case AuthorizationHeaderMalformed:
+			case "AuthorizationHeaderMalformed":
 				fallthrough
-			case InvalidRegion:
+			case "InvalidRegion":
 				fallthrough
-			case AccessDenied:
+			case "AccessDenied":
 				if errResponse.Region == "" {
 					// Region is empty we simply return the error.
 					return res, err
@@ -807,7 +747,7 @@ func (c *Client) executeMethod(ctx context.Context, method string, metadata requ
 	}
 
 	// Return an error when retry is canceled or deadlined
-	if e := ctx.Err(); e != nil {
+	if e := retryCtx.Err(); e != nil {
 		return nil, e
 	}
 
@@ -852,21 +792,14 @@ func (c *Client) newRequest(ctx context.Context, method string, metadata request
 		ctx = httptrace.WithClientTrace(ctx, c.httpTrace)
 	}
 
-	// make sure to de-dup calls to credential services, this reduces
-	// the overall load to the endpoint generating credential service.
-	value, err, _ := c.credsGroup.Do(metadata.bucketName, func() (credentials.Value, error) {
-		if s3utils.IsS3ExpressBucket(metadata.bucketName) && s3utils.IsAmazonEndpoint(*c.endpointURL) {
-			return c.CreateSession(ctx, metadata.bucketName, SessionReadWrite)
-		}
-		// Get credentials from the configured credentials provider.
-		return c.credsProvider.GetWithContext(c.CredContext())
-	})
+	// Initialize a new HTTP request for the method.
+	req, err = http.NewRequestWithContext(ctx, method, targetURL.String(), nil)
 	if err != nil {
 		return nil, err
 	}
 
-	// Initialize a new HTTP request for the method.
-	req, err = http.NewRequestWithContext(ctx, method, targetURL.String(), nil)
+	// Get credentials from the configured credentials provider.
+	value, err := c.credsProvider.Get()
 	if err != nil {
 		return nil, err
 	}
@@ -877,10 +810,6 @@ func (c *Client) newRequest(ctx context.Context, method string, metadata request
 		secretAccessKey = value.SecretAccessKey
 		sessionToken    = value.SessionToken
 	)
-
-	if s3utils.IsS3ExpressBucket(metadata.bucketName) && sessionToken != "" {
-		req.Header.Set("x-amz-s3session-token", sessionToken)
-	}
 
 	// Custom signer set then override the behavior.
 	if c.overrideSignerType != credentials.SignatureDefault {
@@ -948,11 +877,6 @@ func (c *Client) newRequest(ctx context.Context, method string, metadata request
 
 	// For anonymous requests just return.
 	if signerType.IsAnonymous() {
-		if len(metadata.trailer) > 0 {
-			req.Header.Set("X-Amz-Content-Sha256", unsignedPayloadTrailer)
-			return signer.UnsignedTrailer(*req, metadata.trailer), nil
-		}
-
 		return req, nil
 	}
 
@@ -967,13 +891,8 @@ func (c *Client) newRequest(ctx context.Context, method string, metadata request
 		// Streaming signature is used by default for a PUT object request.
 		// Additionally, we also look if the initialized client is secure,
 		// if yes then we don't need to perform streaming signature.
-		if s3utils.IsAmazonExpressRegionalEndpoint(*c.endpointURL) {
-			req = signer.StreamingSignV4Express(req, accessKeyID,
-				secretAccessKey, sessionToken, location, metadata.contentLength, time.Now().UTC(), c.sha256Hasher())
-		} else {
-			req = signer.StreamingSignV4(req, accessKeyID,
-				secretAccessKey, sessionToken, location, metadata.contentLength, time.Now().UTC(), c.sha256Hasher())
-		}
+		req = signer.StreamingSignV4(req, accessKeyID,
+			secretAccessKey, sessionToken, location, metadata.contentLength, time.Now().UTC(), c.sha256Hasher())
 	default:
 		// Set sha256 sum for signature calculation only with signature version '4'.
 		shaHeader := unsignedPayload
@@ -988,12 +907,8 @@ func (c *Client) newRequest(ctx context.Context, method string, metadata request
 		}
 		req.Header.Set("X-Amz-Content-Sha256", shaHeader)
 
-		if s3utils.IsAmazonExpressRegionalEndpoint(*c.endpointURL) {
-			req = signer.SignV4TrailerExpress(*req, accessKeyID, secretAccessKey, sessionToken, location, metadata.trailer)
-		} else {
-			// Add signature version '4' authorization header.
-			req = signer.SignV4Trailer(*req, accessKeyID, secretAccessKey, sessionToken, location, metadata.trailer)
-		}
+		// Add signature version '4' authorization header.
+		req = signer.SignV4Trailer(*req, accessKeyID, secretAccessKey, sessionToken, location, metadata.trailer)
 	}
 
 	// Return request.
@@ -1026,17 +941,8 @@ func (c *Client) makeTargetURL(bucketName, objectName, bucketLocation string, is
 		} else {
 			// Do not change the host if the endpoint URL is a FIPS S3 endpoint or a S3 PrivateLink interface endpoint
 			if !s3utils.IsAmazonFIPSEndpoint(*c.endpointURL) && !s3utils.IsAmazonPrivateLinkEndpoint(*c.endpointURL) {
-				if s3utils.IsAmazonExpressRegionalEndpoint(*c.endpointURL) {
-					if bucketName == "" {
-						host = getS3ExpressEndpoint(bucketLocation, false)
-					} else {
-						// Fetch new host based on the bucket location.
-						host = getS3ExpressEndpoint(bucketLocation, s3utils.IsS3ExpressBucket(bucketName))
-					}
-				} else {
-					// Fetch new host based on the bucket location.
-					host = getS3Endpoint(bucketLocation, c.s3DualstackEnabled)
-				}
+				// Fetch new host based on the bucket location.
+				host = getS3Endpoint(bucketLocation, c.s3DualstackEnabled)
 			}
 		}
 	}
@@ -1088,18 +994,6 @@ func (c *Client) makeTargetURL(bucketName, objectName, bucketLocation string, is
 
 // returns true if virtual hosted style requests are to be used.
 func (c *Client) isVirtualHostStyleRequest(url url.URL, bucketName string) bool {
-	if c.lookupFn != nil {
-		lookup := c.lookupFn(url, bucketName)
-		switch lookup {
-		case BucketLookupDNS:
-			return true
-		case BucketLookupPath:
-			return false
-		}
-		// if its auto then we fallback to default detection.
-		return s3utils.IsVirtualHostSupported(url, bucketName)
-	}
-
 	if bucketName == "" {
 		return false
 	}
@@ -1107,32 +1001,11 @@ func (c *Client) isVirtualHostStyleRequest(url url.URL, bucketName string) bool 
 	if c.lookup == BucketLookupDNS {
 		return true
 	}
-
 	if c.lookup == BucketLookupPath {
 		return false
 	}
 
-	// default to virtual only for Amazon/Google storage. In all other cases use
+	// default to virtual only for Amazon/Google  storage. In all other cases use
 	// path style requests
 	return s3utils.IsVirtualHostSupported(url, bucketName)
-}
-
-// CredContext returns the context for fetching credentials
-func (c *Client) CredContext() *credentials.CredContext {
-	httpClient := c.httpClient
-	if httpClient == nil {
-		httpClient = http.DefaultClient
-	}
-	return &credentials.CredContext{
-		Client:   httpClient,
-		Endpoint: c.endpointURL.String(),
-	}
-}
-
-// GetCreds returns the access creds for the client
-func (c *Client) GetCreds() (credentials.Value, error) {
-	if c.credsProvider == nil {
-		return credentials.Value{}, errors.New("no credentials provider")
-	}
-	return c.credsProvider.GetWithContext(c.CredContext())
 }

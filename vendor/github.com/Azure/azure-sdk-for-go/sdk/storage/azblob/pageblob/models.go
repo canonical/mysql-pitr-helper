@@ -120,8 +120,6 @@ type UploadPagesFromURLOptions struct {
 
 	CPKScopeInfo *blob.CPKScopeInfo
 
-	FileRequestIntent *blob.FileRequestIntentType
-
 	SequenceNumberAccessConditions *SequenceNumberAccessConditions
 
 	SourceModifiedAccessConditions *blob.SourceModifiedAccessConditions
@@ -137,7 +135,6 @@ func (o *UploadPagesFromURLOptions) format() (*generated.PageBlobClientUploadPag
 
 	options := &generated.PageBlobClientUploadPagesFromURLOptions{
 		CopySourceAuthorization: o.CopySourceAuthorization,
-		FileRequestIntent:       o.FileRequestIntent,
 	}
 
 	if o.SourceContentValidation != nil {

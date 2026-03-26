@@ -101,12 +101,6 @@ type ProcStat struct {
 	RSS int
 	// Soft limit in bytes on the rss of the process.
 	RSSLimit uint64
-	// The address above which program text can run.
-	StartCode uint64
-	// The address below which program text can run.
-	EndCode uint64
-	// The address of the start (i.e., bottom) of the stack.
-	StartStack uint64
 	// CPU number last executed on.
 	Processor uint
 	// Real-time scheduling priority, a number in the range 1 to 99 for processes
@@ -116,11 +110,6 @@ type ProcStat struct {
 	Policy uint
 	// Aggregated block I/O delays, measured in clock ticks (centiseconds).
 	DelayAcctBlkIOTicks uint64
-	// Guest time of the process (time spent running a virtual CPU for a guest
-	// operating system), measured in clock ticks.
-	GuestTime int
-	// Guest time of the process's children, measured in clock ticks.
-	CGuestTime int
 
 	proc FS
 }
@@ -183,9 +172,9 @@ func (p Proc) Stat() (ProcStat, error) {
 		&s.VSize,
 		&s.RSS,
 		&s.RSSLimit,
-		&s.StartCode,
-		&s.EndCode,
-		&s.StartStack,
+		&ignoreUint64,
+		&ignoreUint64,
+		&ignoreUint64,
 		&ignoreUint64,
 		&ignoreUint64,
 		&ignoreUint64,
@@ -200,8 +189,6 @@ func (p Proc) Stat() (ProcStat, error) {
 		&s.RTPriority,
 		&s.Policy,
 		&s.DelayAcctBlkIOTicks,
-		&s.GuestTime,
-		&s.CGuestTime,
 	)
 	if err != nil {
 		return ProcStat{}, err
